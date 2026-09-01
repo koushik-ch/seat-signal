@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "seatsignal",
+  "version": "1.0.0",
+  "description": "Showtimes, live seat maps and good-seat scoring for PVR/INOX cinemas across ~116 Indian cities.",
+  "homepage": "https://github.com/koushik-ch/seatsignal",
+  "repository": "https://github.com/koushik-ch/seatsignal",
+  "keywords": ["cinema", "movies", "india", "pvr", "inox", "tickets", "seats"]
+}

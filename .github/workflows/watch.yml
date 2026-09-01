@@ -1,0 +1,68 @@
+name: SeatSignal watch
+
+on:
+  schedule:
+    # Every 5 minutes is the GitHub minimum. Actual firing drifts under load,
+    # so treat this as "within ~10 min", not a precise clock.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# state.json is committed back each run, so two overlapping runs would race.
+concurrency:
+  group: seatsignal-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    # A run holds itself open while a booking window is imminent (see cadence()
+    # in watch.py), so the job is expected to live ~50 min, not 20 seconds. The
+    # cap is the backstop, not the plan.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Poll and alert
+        env:
+          # Set only the secrets for the channel(s) you want - each switches
+          # itself on when its variables are present. See notify.py.
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          GENERIC_WEBHOOK_URL: ${{ secrets.GENERIC_WEBHOOK_URL }}
+          # The chain refuses GitHub's runners, so fetch through our own
+          # deployed service, whose IP it accepts.
+          PVR_PROXY_BASE: ${{ secrets.PVR_PROXY_BASE }}
+          PVR_PROXY_TOKEN: ${{ secrets.PVR_PROXY_TOKEN }}
+        run: python watch.py
+
+      - name: Persist state
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name  "Koushik Ch"
+            git config user.email "koushik-ch@users.noreply.github.com"
+            git add state.json
+            git commit -m "state: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            # Another run may have pushed while this one polled.
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+            git push
+          else
+            echo "no change"
+          fi

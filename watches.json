@@ -1,0 +1,36 @@
+{
+  "watches": [
+    {
+      "name": "The Odyssey - IMAX - PVR Palazzo",
+      "enabled": true,
+
+      "city": "Chennai",
+      "cinema_id": "388",
+      "cinema_slug": "PVR-Palazzo-The-Nexus-Vijaya-Mall",
+      "lat": "13.05053777",
+      "lng": "80.2093132",
+
+      "film_contains": "ODYSSEY",
+      "language": "English",
+      "experience": "imax",
+
+      "horizon_days": 14,
+      "weekdays": ["Sat", "Sun"],
+      "time_between": ["11:00", "15:00"],
+
+      "party_size": 2,
+      "min_adjacent": 2,
+      "min_lead_minutes": 90,
+
+      "seat_detail": true,
+      "alert_on_restock": true,
+
+      "zone_rows": ["F", "E", "D", "C"],
+      "zone_seats": [11, 21],
+
+      "priority": 5,
+      "quiet_hours": ["23:00", "07:00"],
+      "dedup_minutes": 30
+    }
+  ]
+}

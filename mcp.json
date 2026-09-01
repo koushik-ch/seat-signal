@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "seatsignal": {
+      "type": "streamable-http",
+      "url": "https://YOUR_CLOUD_RUN_HOSTNAME/mcp"
+    }
+  }
+}

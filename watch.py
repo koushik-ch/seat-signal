@@ -1,0 +1,1313 @@
+#!/usr/bin/env python3
+"""
+SeatSignal - watch PVR/INOX booking APIs and alert when the right seats open.
+
+Polls a cinema's showtime API across a forward date window and diffs the result
+against the last run. Three things are worth waking up for:
+
+  new_date      a date that was closed (API error / no shows) now has shows
+                -> the booking window just opened
+  new_show      a new session appeared on a date already open
+                -> extra show added, often for a sold-out title
+  back_in_stock a session went from Sold Out back to Available
+                -> someone's cancellation or a released block
+
+State lives in state.json so the diff survives across runs. Stdlib only,
+no pip install, so a GitHub Actions job is just "run python".
+
+Alerts go to whichever channels are configured - see notify.py. Slack,
+Telegram, ntfy, Pushover, Discord, email, a generic webhook, or a GitHub
+issue. Set the environment variables for the one you want.
+
+  python watch.py                 poll, diff, notify
+  python watch.py --dry-run       poll and print, notify nobody, save nothing
+  python watch.py --show-all      print every matching show, not just changes
+"""
+
+import argparse
+import datetime
+import json
+import os
+import sys
+import time
+from concurrent import futures
+
+import core
+import notify
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HERE, "watches.json")
+STATE_PATH = os.path.join(HERE, "state.json")
+
+# Notification policy defaults. Every field can be overridden per watch in
+# watches.json; environment variables are useful for operators who want a
+# different safety net without editing their watch definitions.
+DEFAULT_DEDUP_MINUTES = int(os.environ.get("PVR_DEDUP_MINUTES", "30"))
+FAILURE_ALERT_AFTER = int(os.environ.get("PVR_FAILURE_ALERT_AFTER", "2"))
+FAILURE_ALERT_REPEAT_HOURS = float(
+    os.environ.get("PVR_FAILURE_ALERT_REPEAT_HOURS", "6")
+)
+FAILURE_STATE_KEY = "__failure_alerts__"
+PENDING_ALERTS_KEY = "__pending_alerts__"
+DEDUP_STATE_KEY = "__notification_dedup__"
+
+
+def pvr_fetch_day(watch, date_str):
+    return core.day_sessions(
+        watch["city"], watch["cinema_id"], date_str, watch.get("lat"), watch.get("lng")
+    )
+
+
+def party_of(watch):
+    """How many seats have to be together for this watch to be satisfied."""
+    return max(1, int(watch.get("party_size") or watch.get("min_adjacent", 1)))
+
+
+def pvr_fetch_seats(token, watch):
+    return core.seat_report(
+        token,
+        watch.get("zone_rows"),
+        watch.get("zone_seats"),
+        party_size=party_of(watch),
+        # Never widen a watch. A standing alert exists to fire on the seats you
+        # actually want; widening into a front row to satisfy the party count
+        # would wake you at 05:26 for seats you would not book.
+        auto_widen=False,
+    )
+
+
+def pvr_booking_url(watch, date_str):
+    return "https://www.pvrcinemas.com/cinemasessions/%s/%s/%s" % (
+        watch["city"],
+        watch.get("cinema_slug", "cinema"),
+        watch["cinema_id"],
+    )
+
+
+# --------------------------------------------------------------------------
+# Matching and polling
+# --------------------------------------------------------------------------
+
+
+def clock(text, fmt="%I:%M %p"):
+    """'12:45 PM' -> 765, minutes since midnight. None if it will not parse."""
+    try:
+        when = datetime.datetime.strptime((text or "").strip().upper(), fmt)
+    except (ValueError, AttributeError):
+        return None
+    return when.hour * 60 + when.minute
+
+
+def in_window(show, window):
+    """Is this show inside a ["11:00", "15:00"] style window? 24h, inclusive."""
+    start, end = clock(window[0], "%H:%M"), clock(window[1], "%H:%M")
+    at = clock(show.get("time"))
+    if start is None or end is None or at is None:
+        return True  # an unparseable window must not silently hide every show
+    if end < start:
+        return at >= start or at <= end  # wraps midnight, e.g. a 10:20 PM show
+    return start <= at <= end
+
+
+def matches(show, watch):
+    """Does this show satisfy the watch's film / experience / language filters?"""
+    needle = watch.get("film_contains", "").upper()
+    if needle and needle not in (show["film"] or "").upper():
+        return False
+
+    want_exp = watch.get("experience", "")
+    if want_exp and show["experience"] != want_exp:
+        return False
+
+    # Accept either "English" or "en" in config; shows now carry ISO codes.
+    want_lang = watch.get("language", "")
+    if want_lang:
+        wanted = core.lang_code(want_lang) or str(want_lang).lower()
+        if (show.get("language") or "") != wanted:
+            return False
+
+    # Time of day, as a window rather than an exact time: the same show shifts by
+    # a few minutes between weeks, and a future date's schedule is not knowable
+    # when the watch is written.
+    window = watch.get("time_between")
+    if window and not in_window(show, window):
+        return False
+
+    return True
+
+
+def show_key(show):
+    """Stable identity for a session across runs. sessionId alone is reused."""
+    return "%s|%s|%s" % (show["date"], show["time"], show["screen"])
+
+
+def poll(watch, today, verbose=False, seats=None, known=None):
+    """Poll the forward window. Returns {date: {show_key: show}} for open dates.
+
+    `seats` overrides the watch's seat_detail for this cycle. Schedule-only
+    polling costs one call per date instead of one per showtime, which is what
+    makes it affordable to poll often while waiting for a window to open.
+
+    `known` is the set of dates already in state. A date outside it has never
+    been seen open before, and its seat maps are fetched even in a schedule-only
+    cycle - see below for why.
+
+    Sets poll.answered to the number of dates the upstream actually answered
+    for. A "closed" date counts: the API replied, it just has nothing on sale.
+    Only network failures and blocks count as no answer - that distinction is
+    what the heartbeat needs.
+    """
+    snapshot = {}
+    answered = 0
+    failures = []
+
+    want_days = watch.get("weekdays")
+
+    for offset in range(watch.get("horizon_days", 12)):
+        date = today + datetime.timedelta(days=offset)
+        date_str = date.isoformat()
+
+        # Only the days you'd actually go. Also keeps the request count down,
+        # since each open date costs a seat-map call per showtime.
+        if want_days and date.strftime("%a") not in want_days:
+            continue
+
+        shows, err = pvr_fetch_day(watch, date_str)
+
+        if err and err.startswith("blocked"):
+            # Every further request digs the hole deeper. Abandon this cycle.
+            print("  UPSTREAM BLOCKED - %s" % err, file=sys.stderr)
+            raise core.Blocked(err)
+
+        if err == "closed":
+            answered += 1
+            if verbose:
+                print("  %s  closed" % date_str)
+            continue
+        if err:
+            # A transient network error must not look like a closed date,
+            # otherwise it re-fires as new_date on the next successful run.
+            print("  %s  %s (skipped)" % (date_str, err), file=sys.stderr)
+            failures.append(
+                {
+                    "key": "poll|%s|%s" % (watch["name"], date_str),
+                    "kind": "poll",
+                    "watch": watch["name"],
+                    "date": date_str,
+                    "detail": err,
+                }
+            )
+            snapshot[date_str] = None
+            continue
+
+        answered += 1
+        hits = {show_key(s): s for s in shows if matches(s, watch)}
+
+        want_seats = watch.get("seat_detail") if seats is None else seats
+
+        # The alert for a window opening is the one that decides whether you get
+        # a good seat at all: the zone is 100% free the moment it opens and can
+        # be gone before the next cycle. Waking someone with "booking opened" and
+        # no seat read costs them the only minutes that matter, so a date that
+        # has never been seen open pays for its seat maps immediately, even in a
+        # schedule-only cycle. It happens once per date, not once per poll.
+        if (
+            not want_seats
+            and watch.get("seat_detail")
+            and known is not None
+            and date_str not in known
+        ):
+            want_seats = True
+            if verbose:
+                print("  %s  first sighting - reading seats now" % date_str)
+
+        if want_seats:
+            # One seat-map call per showtime, so fetch them concurrently or a
+            # 5-minute cron spends most of its life waiting on serial requests.
+            # A lapsed show has already started - it has no seat map and can't
+            # be booked. Sold-out ones are still worth fetching, for restocks.
+            todo = [
+                s
+                for s in hits.values()
+                if s.get("token") and s["status"].lower() != "lapsed"
+            ]
+            with futures.ThreadPoolExecutor(max_workers=8) as pool:
+                for show, (seats, err) in zip(
+                    todo, pool.map(lambda s: pvr_fetch_seats(s["token"], watch), todo)
+                ):
+                    if err:
+                        print(
+                            "  %s %s: %s" % (date_str, show["time"], err),
+                            file=sys.stderr,
+                        )
+                    else:
+                        show["seats"] = seats
+
+        if verbose:
+            print(
+                "  %s  %d show(s)  %s"
+                % (
+                    date_str,
+                    len(hits),
+                    "  ".join(
+                        "%s[%s%s]"
+                        % (
+                            s["time"],
+                            s["status"],
+                            " zone %d/%d"
+                            % (s["seats"]["zone_free"], s["seats"]["zone_total"])
+                            if s.get("seats")
+                            else "",
+                        )
+                        for s in hits.values()
+                    ),
+                )
+            )
+        if hits:
+            snapshot[date_str] = hits
+
+    poll.answered = answered
+    poll.failures = failures
+    return snapshot
+
+
+HEARTBEAT_KEY = "__heartbeat__"
+HEARTBEAT_HOURS = float(os.environ.get("PVR_HEARTBEAT_HOURS", "6"))
+# How often to say "still here" even when nothing has changed. Silence and
+# breakage are indistinguishable from the outside, and this watcher spent three
+# days sending alerts into a misconfigured URL while looking perfectly healthy.
+ALIVE_HOURS = float(os.environ.get("PVR_ALIVE_HOURS", "6"))
+
+
+def alive_ping(state, lines, dry_run=False):
+    """Low-priority "still watching" note, at most every ALIVE_HOURS.
+
+    Priority 2, so it lands in the notification list without breaking Do Not
+    Disturb - it is reassurance, not an alarm. Only stamps the clock when a
+    channel actually took it, so a broken channel keeps retrying rather than
+    going quiet for another six hours.
+    """
+    beat = state.setdefault(HEARTBEAT_KEY, {})
+    now = core.now_ist()
+
+    last = beat.get("last_ping")
+    if last:
+        since = (now - datetime.datetime.fromisoformat(last)).total_seconds() / 3600.0
+        if since < ALIVE_HOURS:
+            return False
+
+    body = "\n".join(lines) if lines else "No watches enabled."
+    body += "\n\nLast poll %s" % now.strftime("%d %b %H:%M")
+    if dry_run:
+        print("Watcher alive\n%s" % body)
+        return True
+    if not deliver("\U0001F441️ Watcher alive", body, "", 2):
+        print("  alive ping NOT delivered", file=sys.stderr)
+        return False
+    beat["last_ping"] = now.isoformat(timespec="seconds")
+    return True
+
+
+def check_heartbeat(state, answered_total, dry_run=False):
+    """Alert when the watch has gone blind.
+
+    A blocked or broken watcher fails silently and looks exactly like "nothing
+    has opened yet" - which is how three days of green Actions runs detected
+    nothing. Silence is not evidence, so absence of a successful poll is
+    itself reported.
+    """
+    # Update the record, never replace it. Rebuilding this dict from two known
+    # keys silently dropped last_ping on every successful poll, which restarted
+    # the alive ping's clock each run and turned a six-hourly reassurance into
+    # one every half hour. Anything else kept here would have gone the same way.
+    beat = state.setdefault(HEARTBEAT_KEY, {})
+    now = core.now_ist()
+    stamp = now.isoformat(timespec="seconds")
+
+    if answered_total:
+        beat["last_success"] = stamp
+        return False
+
+    last = beat.get("last_success")
+    if not last:
+        beat["last_success"] = stamp
+        return False
+
+    quiet_h = (now - datetime.datetime.fromisoformat(last)).total_seconds() / 3600.0
+    if quiet_h < HEARTBEAT_HOURS:
+        return False
+
+    # Do not repeat more often than the threshold itself.
+    alerted = beat.get("last_alert")
+    if alerted:
+        since = (now - datetime.datetime.fromisoformat(alerted)).total_seconds() / 3600.0
+        if since < HEARTBEAT_HOURS:
+            return False
+
+    title = "\u26a0\ufe0f Watch is blind"
+    body = ("No successful poll for %.1f hours (last: %s).\n"
+            "The watcher is running but cannot reach the cinema API, so it "
+            "would NOT see a booking window open." % (quiet_h, last[:16].replace("T", " ")))
+    if dry_run:
+        print("%s\n%s" % (title, body))
+    else:
+        if not deliver(title, body, "", 5):
+            return False
+    beat["last_alert"] = stamp
+    return True
+
+
+# --------------------------------------------------------------------------
+# Notification policy and failure reporting
+# --------------------------------------------------------------------------
+
+
+def watch_priority(watch, default=5):
+    """Return a safe ntfy/Pushover-style priority in the inclusive 1..5 range."""
+    try:
+        value = int(watch.get("priority", default))
+    except (TypeError, ValueError):
+        value = default
+    return max(1, min(5, value))
+
+
+def _clock_minutes(value):
+    """Parse HH:MM into minutes since midnight, or return None."""
+    try:
+        hour, minute = (int(part) for part in str(value).strip().split(":", 1))
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def quiet_window(watch):
+    """Return a configured quiet window as `(start, end)` minutes.
+
+    Accepted forms are `["23:00", "07:00"]`,
+    `{ "start": "23:00", "end": "07:00" }`, or the convenient string
+    `"23:00-07:00"`. A window whose end is earlier than its start wraps
+    midnight.
+    """
+    value = watch.get("quiet_hours")
+    if not value:
+        return None
+    if isinstance(value, dict):
+        values = [value.get("start"), value.get("end")]
+    elif isinstance(value, str):
+        values = value.replace(",", "-").split("-", 1)
+    else:
+        values = list(value) if isinstance(value, (list, tuple)) else []
+    if len(values) != 2:
+        return None
+    start, end = (_clock_minutes(item) for item in values)
+    return (start, end) if start is not None and end is not None and start != end else None
+
+
+def in_quiet_hours(watch, now=None):
+    """Whether ordinary alerts should be deferred for this watch."""
+    window = quiet_window(watch)
+    if not window:
+        return False
+    now = now or core.now_ist()
+    minute = now.hour * 60 + now.minute
+    start, end = window
+    return minute >= start or minute < end if end < start else start <= minute < end
+
+
+def event_fingerprint(event):
+    """Stable identity for deduplicating one logical alert."""
+    shows = []
+    for show in event.get("shows") or []:
+        shows.append(
+            "%s|%s|%s|%s"
+            % (
+                show.get("time", ""),
+                show.get("screen", ""),
+                show.get("variant_id", show.get("film", "")),
+                show.get("seats", {}).get("best_where", "")
+                if isinstance(show.get("seats"), dict)
+                else "",
+            )
+        )
+    released = ",".join(sorted(event.get("seats") or []))
+    return "%s|%s|%s|%s" % (
+        event.get("kind", ""),
+        event.get("date", ""),
+        ";".join(sorted(shows)),
+        released,
+    )
+
+
+def _pending_events(state, watch):
+    return state.setdefault(PENDING_ALERTS_KEY, {}).setdefault(watch["name"], [])
+
+
+def prepare_events(state, watch, events, now=None):
+    """Apply quiet-hour deferral and duplicate suppression to new events.
+
+    Events seen during quiet hours are persisted and delivered after quiet hours
+    end. Deduplication is marked only after successful delivery, so a failed
+    channel never causes a real booking opening to disappear.
+    """
+    now = now or core.now_ist()
+    pending = _pending_events(state, watch)
+    by_key = {event_fingerprint(item): item for item in pending}
+    for event in events:
+        by_key.setdefault(event_fingerprint(event), event)
+    combined = list(by_key.values())
+
+    if in_quiet_hours(watch, now):
+        state[PENDING_ALERTS_KEY][watch["name"]] = combined[-50:]
+        return []
+
+    history = state.setdefault(DEDUP_STATE_KEY, {}).setdefault(watch["name"], {})
+    cutoff = now.timestamp() - max(0, int(watch.get("dedup_minutes", DEFAULT_DEDUP_MINUTES))) * 60
+    history = {
+        key: stamp
+        for key, stamp in history.items()
+        if isinstance(stamp, (int, float)) and stamp >= cutoff
+    }
+    state[DEDUP_STATE_KEY][watch["name"]] = history
+    return [event for event in combined if event_fingerprint(event) not in history]
+
+
+def mark_events_delivered(state, watch, events, now=None):
+    """Record successful event delivery and remove those events from pending."""
+    now = now or core.now_ist()
+    history = state.setdefault(DEDUP_STATE_KEY, {}).setdefault(watch["name"], {})
+    for event in events:
+        history[event_fingerprint(event)] = now.timestamp()
+    keys = {event_fingerprint(event) for event in events}
+    pending = _pending_events(state, watch)
+    state[PENDING_ALERTS_KEY][watch["name"]] = [
+        event for event in pending if event_fingerprint(event) not in keys
+    ]
+
+
+def update_failure_state(state, problems, now=None):
+    """Track consecutive poll/delivery failures and return escalations."""
+    now = now or core.now_ist()
+    previous = state.get(FAILURE_STATE_KEY) or {}
+    current = {}
+    for problem in problems:
+        key = problem["key"]
+        old = previous.get(key) or {}
+        current[key] = {
+            "kind": problem.get("kind", "unknown"),
+            "watch": problem.get("watch", ""),
+            "detail": problem.get("detail", ""),
+            "count": int(old.get("count", 0)) + 1,
+            "first_seen": old.get("first_seen", now.isoformat(timespec="seconds")),
+            "last_seen": now.isoformat(timespec="seconds"),
+            "last_alert": old.get("last_alert"),
+        }
+    state[FAILURE_STATE_KEY] = current
+    escalations = []
+    for key, record in current.items():
+        if record["count"] < FAILURE_ALERT_AFTER:
+            continue
+        last_alert = record.get("last_alert")
+        if last_alert:
+            try:
+                elapsed = (now - datetime.datetime.fromisoformat(last_alert)).total_seconds() / 3600.0
+            except ValueError:
+                elapsed = FAILURE_ALERT_REPEAT_HOURS
+            if elapsed < FAILURE_ALERT_REPEAT_HOURS:
+                continue
+        escalations.append((key, record))
+    return escalations
+
+
+def notify_failure_escalations(state, escalations, dry_run=False):
+    """Send a separate operational alert for repeated failures."""
+    if not escalations:
+        return False
+    lines = ["The watcher may be missing booking-window changes:", ""]
+    for _key, record in escalations[:8]:
+        lines.append(
+            "%s | %s | %d consecutive failures | %s"
+            % (
+                record.get("kind", "failure"),
+                record.get("watch") or "global",
+                record.get("count", 0),
+                record.get("detail", "unknown error"),
+            )
+        )
+    title = "⚠️ Watcher delivery/API failure"
+    body = "\n".join(lines)
+    if dry_run:
+        print("%s\n%s" % (title, body), file=sys.stderr)
+        return True
+    sent, _sent_names, _failed = deliver(title, body, "", 5, details=True)
+    if not sent:
+        return False
+    now = core.now_ist().isoformat(timespec="seconds")
+    for key, _record in escalations:
+        if key in state.get(FAILURE_STATE_KEY, {}):
+            state[FAILURE_STATE_KEY][key]["last_alert"] = now
+    return True
+
+
+# --------------------------------------------------------------------------
+# Cadence
+# --------------------------------------------------------------------------
+#
+# The cron cannot be the answer. */5 is GitHub's floor and Actions throttles
+# scheduled workflows to roughly hourly under load, so "poll faster" is not a
+# setting we have. What we do have is the length of a run: a job may hold itself
+# open and keep polling. So the rate is decided here, from what the last poll
+# saw, and a run only holds open when there is something to hold open FOR.
+#
+# Not aggressive by design. The upstream blocks an IP that hammers it and then
+# refuses everything for 15 minutes (core.BLOCK_COOLDOWN) - being blocked during
+# the opening is precisely the failure this is meant to prevent.
+
+OPENED_KEY = "__opened__"
+COLD, NEAR_OPEN, HELD = "cold", "near_open", "held"
+
+# PVR sells on a rolling window of about 5 days. The hour it flips is not
+# published, so treat everything inside this many days as due.
+OPEN_LEAD_DAYS = int(os.environ.get("PVR_OPEN_LEAD_DAYS", "6"))
+# How long after a date opens its withheld rows stay worth watching for.
+HOLD_WATCH_HOURS = float(os.environ.get("PVR_HOLD_WATCH_HOURS", "48"))
+# ...except close to the show itself, where the thing being waited for is no
+# longer a withheld row but a cancellation, and a date this near is worth
+# chasing however long it has been on sale.
+CHASE_DAYS = int(os.environ.get("PVR_CHASE_DAYS", "4"))
+# Seconds between polls while holding a run open.
+INTERVALS = {
+    # Schedule only - one call per date, so this can be frequent cheaply.
+    NEAR_OPEN: int(os.environ.get("PVR_NEAR_INTERVAL", "600")),
+    # A seat map per showtime, so a good deal more expensive per cycle.
+    HELD: int(os.environ.get("PVR_HELD_INTERVAL", "300")),
+}
+# Total seconds a single run may hold itself open. Under GitHub's 6h job cap and
+# short enough that the next cron pickup takes over cleanly.
+HOLD_BUDGET = int(os.environ.get("PVR_HOLD_BUDGET", "3000"))
+
+
+def wanted_dates(watch, today):
+    """The dates this watch would actually go on, inside its horizon."""
+    want_days = watch.get("weekdays")
+    out = []
+    for offset in range(watch.get("horizon_days", 12)):
+        date = today + datetime.timedelta(days=offset)
+        if want_days and date.strftime("%a") not in want_days:
+            continue
+        out.append(date)
+    return out
+
+
+def cadence(watch, snapshot, state, today):
+    """(mode, reason) - how hard to poll right now, from what we just saw.
+
+    held      a target date is on sale but cannot seat the party. PVR opens a
+              date with rows withheld, so the seats we want routinely appear
+              minutes or hours AFTER the window itself; "booking opened" is not
+              the end of the wait. Polls with seat maps.
+    near_open a target date is inside the selling window but not on sale yet.
+              Polls the schedule only - one call per date.
+    cold      nothing imminent. One pass and exit, as before.
+    """
+    need = party_of(watch)
+    opened = (state.get(OPENED_KEY) or {}).get(watch["name"], {})
+    now = core.now_ist()
+
+    now_ms = int(now.timestamp() * 1000)
+    for date_str in sorted(d for d, v in snapshot.items() if v):
+        # A show already under way cannot be booked, and its seat map stops
+        # answering - which reads as "opened, seats not read yet" and would hold
+        # the run open all evening chasing a screening that has finished.
+        live = [s for s in snapshot[date_str].values() if lead_ok(s, watch, now_ms)]
+        if not live:
+            continue
+
+        first = opened.get(date_str)
+        days_out = (datetime.date.fromisoformat(date_str) - today).days
+        if first and days_out > CHASE_DAYS:
+            age_h = (
+                now - datetime.datetime.fromisoformat(first)
+            ).total_seconds() / 3600.0
+            if age_h > HOLD_WATCH_HOURS:
+                # Long open, still short, and not for a while yet - that is a
+                # sold-out show rather than a held one, and chasing it would
+                # hold a run open every hour for weeks. The ordinary cron still
+                # polls it; it just stops getting the fast cadence.
+                continue
+
+        rated = [s for s in live if s.get("seats")]
+        if not rated:
+            if watch.get("seat_detail"):
+                # Opened during a schedule-only cycle. Go and read the seats.
+                return HELD, "%s just opened, seats not read yet" % date_str
+            continue
+
+        if any(s["seats"].get("best_run", 0) >= need for s in rated):
+            continue  # satisfiable already; nothing to hold open for
+
+        held = sum(s["seats"].get("zone_held", 0) for s in rated)
+        return HELD, "%s open but no %d together in zone%s" % (
+            date_str,
+            need,
+            " (%d seat(s) withheld)" % held if held else "",
+        )
+
+    for date in wanted_dates(watch, today):
+        if snapshot.get(date.isoformat()):
+            continue
+        out = (date - today).days
+        if out <= OPEN_LEAD_DAYS:
+            return NEAR_OPEN, "%s due to open (%d days out)" % (date.isoformat(), out)
+
+    return COLD, "nothing due"
+
+
+def seat_row(label):
+    """'E21' -> 'E'. Row names run to two letters in the bigger halls."""
+    return "".join(ch for ch in str(label) if ch.isalpha()).upper()
+
+
+def seat_number(label):
+    """'L10' -> 10. Sorting seats as text puts L10 before L9 and lies about runs."""
+    digits = "".join(ch for ch in str(label) if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def by_row(labels):
+    """['A1','A2','C7'] -> 'A1-A2 (2), C7'. Reads at a glance on a lock screen."""
+    rows = {}
+    for label in labels:
+        rows.setdefault(seat_row(label), []).append(label)
+    out = []
+    for row in sorted(rows):
+        seats = sorted(rows[row], key=seat_number)
+        if len(seats) <= 2:
+            out.append(", ".join(seats))
+        else:
+            out.append("%s-%s (%d)" % (seats[0], seats[-1], len(seats)))
+    return ", ".join(out)
+
+
+def carry_ever_free(previous, snapshot):
+    """Accumulate, per show, every seat in the hall ever observed free.
+
+    PVR uses one code for sold and withheld alike, so the seat map cannot say
+    which is which. What it cannot hide is history: a seat that has never once
+    been free since we first saw the show was never on sale, and when it does
+    come free that is a RELEASE, not a cancellation. Those are the seats worth
+    waiting for, and the only way to know them is to have been watching.
+
+    Tracked across the WHOLE hall, not just the zone. The last row is commonly
+    held for VIP requests and released a few hours before the show, and those
+    seats sit outside any centre-block zone - watching only the zone would miss
+    exactly the release most likely to happen.
+
+    Kept on the show rather than inside its seat report, so a cycle whose seat
+    read failed does not erase the history.
+    """
+    for date_str, shows in snapshot.items():
+        if not shows:
+            continue
+        prev_shows = previous.get(date_str) or {}
+        for key, show in shows.items():
+            was = set((prev_shows.get(key) or {}).get("ever_free") or [])
+            report = show.get("seats") or {}
+            show["ever_free"] = sorted(was | set(report.get("free_labels") or []))
+            # Stamps WHICH roster the history was built against. History gathered
+            # when only the zone was tracked says nothing about the rest of the
+            # hall, and reading it as if it did would report every free seat in
+            # the house as newly released. See diff().
+            show["ever_free_scope"] = "hall"
+
+
+def never_free(show):
+    """Hall seats never observed free. () if the roster is not known yet."""
+    report = show.get("seats") or {}
+    roster = report.get("all_labels")
+    if not roster:
+        return ()
+    return tuple(sorted(set(roster) - set(show.get("ever_free") or [])))
+
+
+def back_rows(report, depth=2):
+    """The rearmost row names. rows_seen runs front-first, so these are the end.
+
+    The back rows are where a house holds seats back, and where a released seat
+    is worth the most.
+    """
+    seen = (report or {}).get("rows_seen") or []
+    return {str(r).upper() for r in seen[-depth:] if r}
+
+
+def record_opened(state, watch, snapshot):
+    """First time each date answered with shows. Ages the held-row watch."""
+    book = state.setdefault(OPENED_KEY, {}).setdefault(watch["name"], {})
+    stamp = core.now_ist().isoformat(timespec="seconds")
+    for date_str, shows in snapshot.items():
+        if shows and date_str not in book:
+            book[date_str] = stamp
+
+
+# --------------------------------------------------------------------------
+# Diffing
+# --------------------------------------------------------------------------
+
+ICON = "\U0001F6A8"
+AVAILABLE = {"available", "filling up fast", "filling fast"}
+
+
+def lead_ok(show, watch, now_ms):
+    """Is there still time to actually get there?
+
+    An alert for a show starting in 11 minutes at a cinema 25 km away is
+    accurate and useless. Shows nearer than min_lead_minutes are still tracked
+    in state - they are just not worth waking someone for.
+    """
+    need = watch.get("min_lead_minutes", 0)
+    if not need or not show.get("ts"):
+        return True
+    return (show["ts"] - now_ms) >= need * 60000
+
+
+def diff(watch, previous, snapshot):
+    """Compare against the last run and return a list of alert-worthy events."""
+    events = []
+    now_ms = int(core.now_ist().timestamp() * 1000)
+    open_now = {d: v for d, v in snapshot.items() if v is not None}
+
+    for date_str in sorted(open_now):
+        shows = open_now[date_str]
+        was = previous.get(date_str)
+
+        if was is None:
+            # None here means "not in previous state at all" -> the window opened.
+            in_time = [s for s in shows.values() if lead_ok(s, watch, now_ms)]
+            if in_time:
+                events.append(
+                    {
+                        "kind": "new_date",
+                        "date": date_str,
+                        "shows": sorted(in_time, key=lambda s: s.get("ts", 0)),
+                    }
+                )
+            continue
+
+        for key, show in sorted(shows.items()):
+            before = was.get(key)
+            if not lead_ok(show, watch, now_ms):
+                continue
+            if before is None:
+                events.append({"kind": "new_show", "date": date_str, "shows": [show]})
+                continue
+
+            if watch.get("alert_on_restock", True):
+                old = (before.get("status") or "").lower()
+                new = (show.get("status") or "").lower()
+                if old not in AVAILABLE and new in AVAILABLE:
+                    events.append(
+                        {"kind": "back_in_stock", "date": date_str, "shows": [show]}
+                    )
+                    continue
+
+            # A zone seat coming free for the FIRST time since we started
+            # watching was never on sale to begin with - the house was holding
+            # it. That is a different event from a cancellation and a better one:
+            # releases come in blocks, cancellations come one seat at a time.
+            # Only meaningful once the previous run's history covered the same
+            # roster. On the cycle that widens it, seed and stay quiet - every
+            # free seat in the hall would otherwise read as a release.
+            widened = before.get("ever_free_scope") != "hall"
+            opened_up = sorted(
+                set((show.get("seats") or {}).get("free_labels") or [])
+                - set(before.get("ever_free") or [])
+            )
+            if widened and opened_up:
+                print(
+                    "  %s %s: seeded hall history (%d free), not alerting"
+                    % (date_str, show["time"], len(opened_up)),
+                    file=sys.stderr,
+                )
+            elif opened_up:
+                events.append(
+                    {
+                        "kind": "released",
+                        "date": date_str,
+                        "shows": [show],
+                        "seats": opened_up,
+                    }
+                )
+                continue
+
+            # A show that frees up a seat in the zone is the case worth waking
+            # for. Alert only when the best block crosses the threshold from
+            # below, so a show sitting above it does not re-fire every run.
+            need = watch.get("min_adjacent", 0)
+            if need and show.get("seats") and before.get("seats"):
+                was_run = before["seats"].get("best_run", 0)
+                now_run = show["seats"].get("best_run", 0)
+                if was_run < need <= now_run:
+                    events.append(
+                        {"kind": "seats_freed", "date": date_str, "shows": [show]}
+                    )
+
+    return events
+
+
+# --------------------------------------------------------------------------
+# Slack
+# --------------------------------------------------------------------------
+
+HEADLINES = {
+    # Real emoji, not Slack :codes: - these have to render on Telegram, ntfy,
+    # email and a GitHub issue too.
+    "new_date": "\U0001F6A8 Booking just opened",
+    "new_show": "\U0001F195 Show added",
+    "back_in_stock": "\u267B\uFE0F Back in stock",
+    "seats_freed": "\U0001FA91 Good seats opened up",
+    "released": "\U0001F39F\uFE0F Withheld seats RELEASED",
+}
+
+
+def seat_summary(show):
+    return core.describe_seats(show.get("seats"))
+
+
+def short_seats(show):
+    """The seat read at a glance: '11 together - D11-D21'.
+
+    A phone notification gets three or four lines before it truncates, so this
+    drops everything you already know (the screen, the film, the percentage)
+    and keeps only what decides whether you stop what you're doing.
+    """
+    report = show.get("seats")
+    if not report:
+        return show.get("status", "")
+    if not report.get("best_run"):
+        held = report.get("zone_held") or 0
+        # Withheld and sold look the same in the seat map until you count the
+        # status codes, and the difference decides whether waiting is worth it.
+        return "no good seats (%d withheld)" % held if held else "no good seats"
+    if report["best_run"] == 1:
+        return "1 seat - %s" % report["best_where"]
+    return "%d together - %s" % (report["best_run"], report["best_where"])
+
+
+def format_alert(watch, events):
+    """Plain text, so it renders the same on every channel.
+
+    Returns (title, body, url, priority). The title carries the event and the
+    date, because on a lock screen that is often all you read.
+    """
+    url = pvr_booking_url(watch, events[0]["date"])
+
+    def pretty(date_str):
+        return datetime.date.fromisoformat(date_str).strftime("%a %-d %b")
+
+    if len(events) == 1:
+        ev = events[0]
+        title = "%s - %s" % (HEADLINES[ev["kind"]], pretty(ev["date"]))
+    else:
+        dates = sorted({pretty(e["date"]) for e in events})
+        title = "%s %d updates - %s" % (
+            ICON,
+            len(events),
+            ", ".join(dates[:3]) + ("..." if len(dates) > 3 else ""),
+        )
+
+    lines = [watch["name"]]
+    for ev in events:
+        if len(events) > 1:
+            lines.append("")
+            lines.append("%s - %s" % (HEADLINES[ev["kind"]], pretty(ev["date"])))
+        lines.append("")
+        for s in ev["shows"]:
+            # Two columns, so the times line up and the eye runs straight down
+            # the seat column.
+            lines.append("%-9s %s" % (s["time"], short_seats(s)))
+            if ev.get("seats"):
+                # Name them, grouped by row. These went on sale for the first
+                # time just now, so the seat numbers ARE the message.
+                lines.append("%-9s just released: %s" % ("", by_row(ev["seats"])))
+                report = s.get("seats") or {}
+                zone = set(report.get("zone_labels") or [])
+                rear = back_rows(report)
+                where = []
+                if zone & set(ev["seats"]):
+                    where.append("in your zone")
+                hit = rear & {seat_row(x) for x in ev["seats"]}
+                if hit:
+                    where.append(
+                        "back row%s %s"
+                        % ("" if len(hit) == 1 else "s", ", ".join(sorted(hit)))
+                    )
+                if where:
+                    lines.append("%-9s %s" % ("", " and ".join(where)))
+            held = never_free(s)
+            if held:
+                lines.append(
+                    "%-9s %d of %d seats in the hall still never seen free"
+                    % ("", len(held), len((s.get("seats") or {}).get("all_labels") or []))
+                )
+
+    # A window opening is not the same as your seats being buyable - PVR opens a
+    # date with rows withheld. Saying "booking opened" and stopping there sends
+    # someone to a seat map with nothing on it, so spell out which it is.
+    need = party_of(watch)
+    seen = [s for ev in events for s in ev["shows"] if s.get("seats")]
+    if seen and not any(s["seats"].get("best_run", 0) >= need for s in seen):
+        lines.append("")
+        lines.append("No %d together in the zone yet - still watching." % need)
+
+    # Anything that needs you to act now goes at max priority, so it breaks
+    # through Do Not Disturb. An extra show on an already-open date does not.
+    urgent = {"new_date", "seats_freed", "released"}
+    default_priority = 5 if any(e["kind"] in urgent for e in events) else 4
+    # A watch may deliberately be informational (1-3) or urgent (5). The
+    # configured value caps the computed event urgency, so a quiet side-watch
+    # cannot unexpectedly break through Do Not Disturb.
+    priority = min(default_priority, watch_priority(watch, default_priority))
+
+    return title, "\n".join(lines), url, priority
+
+
+def deliver(title, body, url, priority=5, details=False):
+    """Deliver an alert and optionally return `(ok, sent, failures)`."""
+    channels = notify.configured()
+    if not channels:
+        print(
+            "No notification channel configured - printing instead:\n%s\n%s\n%s"
+            % (title, body, url)
+        )
+        result = (False, [], ["no configured notification channel"])
+        return result if details else result[0]
+
+    sent, failed = notify.send(title, body, url, priority)
+    for problem in failed:
+        print("  delivery failed - %s" % problem, file=sys.stderr)
+    if sent:
+        print("  alerted via %s" % ", ".join(sent))
+    result = (bool(sent), sent, failed)
+    return result if details else result[0]
+
+
+# --------------------------------------------------------------------------
+
+
+def stream(config, state, args, state_path):
+    """Poll forever, printing ONE LINE per event on stdout.
+
+    This is the shape an agent's watch tool wants: keep the polling in Python,
+    where it costs nothing, and surface only actual events to the model. The
+    alternative - waking a model every few minutes to poll an API itself - buys
+    nothing and burns a turn each time.
+
+    Nothing is delivered to a notification channel here; the caller reading
+    stdout is the channel.
+    """
+    while True:
+        today = core.today_ist()
+        for watch in config["watches"]:
+            if not watch.get("enabled", True):
+                continue
+            if args.watch and watch["name"] != args.watch:
+                continue
+
+            try:
+                snapshot = poll(watch, today)
+            except core.Blocked as exc:
+                print("  paused: %s" % exc, file=sys.stderr)
+                continue
+            previous = state.get(watch["name"], {})
+            carry_ever_free(previous, snapshot)
+            if previous:
+                for ev in diff(watch, previous, snapshot):
+                    when = datetime.date.fromisoformat(ev["date"]).strftime("%a %-d %b")
+                    for show in ev["shows"]:
+                        print(
+                            "%s | %s | %s %s | %s"
+                            % (
+                                HEADLINES[ev["kind"]],
+                                watch["name"],
+                                when,
+                                show["time"],
+                                short_seats(show),
+                            ),
+                            flush=True,  # unbuffered, or events sit unseen
+                        )
+
+            merged = dict(previous)
+            for date_str, shows in snapshot.items():
+                if shows is not None:
+                    merged[date_str] = shows
+            cutoff = today.isoformat()
+            state[watch["name"]] = {d: v for d, v in merged.items() if d >= cutoff}
+
+        with open(state_path, "w") as fh:
+            json.dump(state, fh, indent=1, sort_keys=True)
+        time.sleep(max(30, args.interval))
+
+
+def run_once(config, state, args, state_path, mode_hint=None):
+    """One full pass over every enabled watch. Returns (mode, reason).
+
+    The mode is the hottest any single watch asked for, since one date about to
+    release its held rows is reason enough to keep the whole run alive.
+    """
+    today = core.today_ist()
+    fired = 0
+    blocked = 0
+    answered_total = 0
+    modes = []
+    alive_lines = []
+    problems = []
+
+    for watch in config["watches"]:
+        if not watch.get("enabled", True):
+            continue
+        if args.watch and watch["name"] != args.watch:
+            continue
+
+        print("%s" % watch["name"])
+        # A watch that has polled for days with nothing on sale sits at {} - which
+        # is NOT the same as never having polled, though both are falsy. Reading
+        # it as "first run" made the watcher record its first real opening as a
+        # baseline and say nothing: it swallowed the 15/16 Aug window on
+        # 2026-08-12. Presence of the key is the baseline, not its contents.
+        previous = state.get(watch["name"])
+        first_ever = previous is None
+        previous = previous or {}
+
+        # Waiting for a window to open, there is nothing to read a seat map FOR,
+        # and skipping them turns a cycle from one call per showtime into one per
+        # date. That is what makes polling often affordable. Dates we have never
+        # seen open are the exception - poll() reads their seats regardless.
+        seats = False if mode_hint == NEAR_OPEN else None
+        try:
+            snapshot = poll(
+                watch, today, verbose=args.show_all, seats=seats, known=set(previous)
+            )
+        except core.Blocked as exc:
+            # Upstream is refusing us. Skipping a cycle is the correct outcome -
+            # crashing the job turns a transient block into a red workflow and
+            # loses the run's state write.
+            print("  skipped: %s" % exc, file=sys.stderr)
+            blocked += 1
+            problems.append(
+                {
+                    "key": "blocked|%s" % watch["name"],
+                    "kind": "upstream_blocked",
+                    "watch": watch["name"],
+                    "detail": str(exc),
+                }
+            )
+            continue
+        answered_total += getattr(poll, "answered", 0)
+        problems.extend(getattr(poll, "failures", []))
+
+        # Before diffing: a date that opened starts its held-row clock now, and
+        # the cadence has to be decided even if an alert later fails to send.
+        record_opened(state, watch, snapshot)
+        # Must precede the diff: the diff reads the PREVIOUS run's ever_free,
+        # and this is what writes the current one forward.
+        carry_ever_free(previous, snapshot)
+        mode, reason = cadence(watch, snapshot, state, today)
+        modes.append((mode, "%s - %s" % (watch["name"], reason)))
+        print("  cadence: %s - %s" % (mode, reason))
+
+        # One line per watch for the alive ping: what it is looking at, and how
+        # close it is - so the reassurance carries information, not just a pulse.
+        seat_bits = []
+        for date_str in sorted(d for d, v in snapshot.items() if v):
+            best = max(
+                (s.get("seats") or {}).get("best_run", 0)
+                for s in snapshot[date_str].values()
+            )
+            seat_bits.append(
+                "%s %s"
+                % (
+                    datetime.date.fromisoformat(date_str).strftime("%a %-d %b"),
+                    "%d together" % best if best else "nothing in zone",
+                )
+            )
+        alive_lines.append(
+            "%s\n  %s | %s"
+            % (watch["name"], mode, "; ".join(seat_bits) or "not on sale yet")
+        )
+
+        # First ever run: record the baseline silently, or every open date
+        # would fire as a discovery.
+        if first_ever:
+            # Count only dates that actually answered - an errored date is not
+            # an open one, and saying so overstates what was recorded.
+            print("  baseline recorded (%d open date(s))"
+                  % len([v for v in snapshot.values() if v]))
+        else:
+            events = diff(watch, previous, snapshot)
+            notify_events = prepare_events(state, watch, events)
+            if notify_events:
+                fired += len(notify_events)
+                title, body, url, priority = format_alert(watch, notify_events)
+                if args.dry_run:
+                    print("%s\n%s\n%s" % (title, body, url))
+                    mark_events_delivered(state, watch, notify_events)
+                else:
+                    delivered, _sent, delivery_failures = deliver(
+                        title, body, url, priority, details=True
+                    )
+                    for failure in delivery_failures:
+                        problems.append(
+                            {
+                                "key": "notification|%s" % failure.split(":", 1)[0],
+                                "kind": "notification",
+                                "watch": watch["name"],
+                                "detail": failure,
+                            }
+                        )
+                    if delivered:
+                        mark_events_delivered(state, watch, notify_events)
+                    else:
+                        # Advancing state here would swallow the opening for good -
+                        # it can only ever be reported once. Leave the old state so
+                        # the next run fires it again.
+                        print("  NOT DELIVERED - state held back", file=sys.stderr)
+                        continue
+            else:
+                print("  no change%s (%d open date(s))"
+                      % (" (quiet hours or duplicate suppressed)" if events else "",
+                         len([v for v in snapshot.values() if v])))
+
+        # Dates that errored this run keep their previous value, so a flaky
+        # poll never manufactures a new_date on the following run.
+        merged = dict(previous)
+        for date_str, shows in snapshot.items():
+            if shows is not None:
+                merged[date_str] = shows
+        # Drop dates that have fallen out of the window entirely.
+        cutoff = today.isoformat()
+        merged = {d: v for d, v in merged.items() if d >= cutoff}
+        state[watch["name"]] = merged
+
+    if check_heartbeat(state, answered_total, args.dry_run):
+        print("  heartbeat ALERT sent - watch has gone blind", file=sys.stderr)
+    elif answered_total and alive_ping(state, alive_lines, args.dry_run):
+        print("  alive ping sent")
+
+    escalations = update_failure_state(state, problems)
+    if notify_failure_escalations(state, escalations, args.dry_run):
+        print("  failure alert sent", file=sys.stderr)
+
+    if not args.dry_run:
+        with open(state_path, "w") as fh:
+            json.dump(state, fh, indent=1, sort_keys=True)
+
+    if blocked:
+        print("%d watch(es) skipped - upstream blocked this runner" % blocked)
+        # Polling harder into a block is how the block gets extended.
+        return COLD, "upstream blocked"
+
+    for level in (HELD, NEAR_OPEN):
+        for mode, reason in modes:
+            if mode == level:
+                return level, reason
+    return COLD, "nothing due"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--dry-run", action="store_true", help="never write state or notify")
+    ap.add_argument("--show-all", action="store_true", help="print every matching show")
+    ap.add_argument("--watch", help="run only the watch with this name")
+    ap.add_argument(
+        "--test-notification",
+        action="store_true",
+        help="send one test message; combine with --watch to target a watch",
+    )
+    ap.add_argument(
+        "--once",
+        action="store_true",
+        help="one pass and exit; never hold the run open to keep polling",
+    )
+    ap.add_argument(
+        "--stream",
+        action="store_true",
+        help="poll forever, print one line per event (for an agent to watch)",
+    )
+    ap.add_argument(
+        "--interval", type=int, default=60, help="seconds between polls in --stream"
+    )
+    ap.add_argument(
+        "--state",
+        default=STATE_PATH,
+        help="state file to use. Point an in-session --stream at its own copy "
+        "so it does not fight the cron over the committed one.",
+    )
+    args = ap.parse_args()
+
+    with open(CONFIG_PATH) as fh:
+        config = json.load(fh)
+
+    if args.test_notification:
+        candidates = [
+            watch
+            for watch in config.get("watches", [])
+            if watch.get("enabled", True)
+            and (not args.watch or watch.get("name") == args.watch)
+        ]
+        if not candidates:
+            print("No enabled watch matched --watch.", file=sys.stderr)
+            return 2
+        watch = candidates[0]
+        title = "🔔 PVR watcher test"
+        body = (
+            "Notification delivery is configured for %s.\n"
+            "Priority: %d\n"
+            "Quiet hours: %s\n"
+            "Deduplication: %s minutes"
+            % (
+                watch.get("name", "watch"),
+                watch_priority(watch),
+                watch.get("quiet_hours") or "off",
+                watch.get("dedup_minutes", DEFAULT_DEDUP_MINUTES),
+            )
+        )
+        delivered = deliver(
+            title,
+            body,
+            pvr_booking_url(watch, core.today_ist().isoformat()),
+            watch_priority(watch),
+        )
+        return 0 if delivered else 1
+
+    state_path = args.state
+    state = {}
+    if os.path.exists(state_path):
+        with open(state_path) as fh:
+            state = json.load(fh)
+
+    if args.stream:
+        return stream(config, state, args, state_path)
+
+    mode, reason = run_once(config, state, args, state_path)
+    if args.once or args.dry_run:
+        return 0
+
+    # Hold the run open while something is imminent. The cron fires this job at
+    # whatever rate Actions feels like; how long each job LIVES is the only part
+    # of the cadence we control, so that is the lever being pulled.
+    deadline = time.monotonic() + HOLD_BUDGET
+    while mode in INTERVALS:
+        wait = INTERVALS[mode]
+        if time.monotonic() + wait > deadline:
+            print("hold budget spent - the next scheduled run takes over")
+            break
+        print("holding (%s): %s - next poll in %ds" % (mode, reason, wait))
+        time.sleep(wait)
+        mode, reason = run_once(config, state, args, state_path, mode_hint=mode)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
