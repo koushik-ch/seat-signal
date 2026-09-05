@@ -1,12 +1,12 @@
 {
  "__failure_alerts__": {
   "blocked|The Odyssey - IMAX - PVR Palazzo": {
-   "count": 32,
+   "count": 33,
    "detail": "blocked: upstream returned 403/429; cooling off for 899 more seconds",
    "first_seen": "2026-09-02T00:08:53+05:30",
    "kind": "upstream_blocked",
    "last_alert": null,
-   "last_seen": "2026-09-06T00:05:24+05:30",
+   "last_seen": "2026-09-06T02:10:59+05:30",
    "watch": "The Odyssey - IMAX - PVR Palazzo"
   }
  },
